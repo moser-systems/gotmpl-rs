@@ -5382,3 +5382,13 @@ fn test_parse_errors_use_go_format_and_wording() {
     fail("{{nope 1}}", &Value::Nil);
     fail("{{if true}}{{$x := 1}}{{end}}{{$x}}", &Value::Nil);
 }
+
+
+#[test]
+fn test_template_without_argument_gets_nil() {
+    ok(
+        r#"{{define "t"}}<{{.}}>{{end}}{{template "t"}}"#,
+        &Value::String("ignored".into()),
+        "<<no value>>",
+    );
+}

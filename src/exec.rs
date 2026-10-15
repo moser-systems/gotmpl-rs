@@ -626,10 +626,12 @@ impl<'a> Executor<'a> {
         tmpl: &TemplateNode,
         dot: &Value,
     ) -> ExecResult<()> {
+        // Go's walkTemplate evaluates the pipeline if there is one and
+        // otherwise passes nil: `{{template "t"}}` does not forward dot.
         let new_dot = if let Some(ref pipe) = tmpl.pipe {
             self.eval_pipeline(dot, pipe)?
         } else {
-            dot.clone()
+            Value::Nil
         };
 
         let Some(tree) = self.templates.get(tmpl.name.as_str()).map(Arc::clone) else {
