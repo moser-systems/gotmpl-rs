@@ -5339,3 +5339,14 @@ fn test_uint_literal_in_dead_branch_is_fine() {
         "",
     );
 }
+
+// Parity regressions (Go cross-checked).
+
+#[test]
+fn test_template_without_argument_gets_nil() {
+    ok(
+        r#"{{define "t"}}<{{.}}>{{end}}{{template "t"}}"#,
+        &Value::String("ignored".into()),
+        "<<no value>>",
+    );
+}
