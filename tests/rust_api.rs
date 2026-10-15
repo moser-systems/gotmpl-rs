@@ -1200,17 +1200,15 @@ fn test_unsupported_type_struct_into_map_bridge() {
 
 #[test]
 fn test_numeric_imaginary_literal_pinned_divergence() {
+    // Go parses `3i` as a complex constant; gotmpl has no complex numbers and
+    // lexes `3` followed by the identifier `i`, which is not a function.
     let err = Template::new("t")
         .parse("{{3i}}")
-        .ok()
-        .expect("parse currently succeeds")
-        .execute_to_string(&Value::Nil)
         .err()
-        .expect("exec must error on the trailing identifier");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("can't give argument to non-function"),
-        "got: {msg}"
+        .expect("parse must fail on the unknown function `i`");
+    assert_eq!(
+        err.to_string(),
+        r#"template: t:1: function "i" not defined"#
     );
 }
 
@@ -1229,7 +1227,7 @@ fn test_numeric_incomplete_hex_errors_at_parse() {
         .parse("{{0x}}")
         .err()
         .expect("expected parse error");
-    assert!(err.to_string().contains("invalid hex number"));
+    assert_eq!(err.to_string(), r#"template: t:1: bad number syntax: "0x""#);
 }
 
 #[test]
@@ -1305,13 +1303,12 @@ fn test_template_call_does_not_see_caller_var() {
     // Mirror: the caller's `$x` must not be visible inside the callee, even
     // when the callee declares no shadow. Go errors on `undefined variable`.
     let src = r#"{{define "child"}}{{$x}}{{end}}{{$x := 1}}{{template "child"}}"#;
-    let err = Template::new("root")
-        .parse(src)
-        .unwrap()
-        .execute_to_string(&Value::Nil)
-        .err()
-        .expect("expected undefined variable error in callee");
-    assert!(matches!(err, gotmpl::TemplateError::UndefinedVariable(_)));
+    // Go rejects this at parse time: a define body starts with only `$` in scope.
+    let err = Template::new("root").parse(src).err().expect("parse error");
+    assert_eq!(
+        err.to_string(),
+        r#"template: root:1: undefined variable "$x""#
+    );
 }
 
 // Lookup parity — divergence pin (Phase 8.4).
@@ -1475,7 +1472,7 @@ fn test_delims_empty_right_errors_at_parse() {
         .expect("expected error from empty right delim");
     let msg = err.to_string();
     assert!(
-        msg.contains("empty command") || msg.contains("delim"),
+        msg.contains("missing value") || msg.contains("delim"),
         "got: {msg}"
     );
 }
@@ -1704,15 +1701,16 @@ fn test_runtime_error_missingkey_lacks_position_info() {
 }
 
 #[test]
-fn test_runtime_error_undefined_function_lacks_position_info() {
-    // `{{undefinedFn}}` — no Pos at error time. Exact match so any future
-    // `template: t:2:3:` prefix shows up here.
+fn test_undefined_function_is_a_parse_error() {
+    // Like Go, an undefined function is rejected at parse time with its line.
     let err = Template::new("t")
         .parse("a\n{{undefinedFn}}\nb")
-        .unwrap()
-        .execute_to_string(&Value::Nil)
-        .unwrap_err();
-    assert_eq!(err.to_string(), "undefined function: undefinedFn");
+        .err()
+        .expect("parse error");
+    assert_eq!(
+        err.to_string(),
+        r#"template: t:2: function "undefinedFn" not defined"#
+    );
 }
 
 #[test]

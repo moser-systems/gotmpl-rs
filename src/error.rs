@@ -9,13 +9,15 @@ use alloc::format;
 use alloc::string::String;
 use thiserror::Error;
 
-/// Shared formatter for source-location errors (parse and lex). With a name,
-/// the format matches Go: `template: foo.tmpl:12:5: msg`. Without a name, the
-/// name segment is dropped but the rest of the format stays the same.
-fn fmt_src_err(name: &Option<String>, line: usize, col: usize, message: &str) -> String {
+/// Shared formatter for source-location errors (parse and lex). Without a
+/// name, the name segment is dropped but the rest of the format stays the same.
+/// Formats a lex or parse error like Go's `parse.(*Tree).errorf`:
+/// `template: <name>:<line>: <message>`. Go reports only the line for syntax
+/// errors; the column stays available in the error's `col` field.
+fn fmt_src_err(name: &Option<String>, line: usize, _col: usize, message: &str) -> String {
     match name {
-        Some(n) => format!("template: {n}:{line}:{col}: {message}"),
-        None => format!("template: {line}:{col}: {message}"),
+        Some(n) => format!("template: {n}:{line}: {message}"),
+        None => format!("template: {line}: {message}"),
     }
 }
 
@@ -116,7 +118,8 @@ pub enum TemplateError {
     /// The optional `name` tags the template's origin (e.g. the file name
     /// when parsing via [`parse_files`](crate::Template::parse_files)). It is
     /// prefixed Go-style in the `Display` output:
-    /// `template: <name>:<line>:<col>: <message>`.
+    /// `template: <name>:<line>: <message>` (Go reports no column for syntax
+    /// errors; `col` is still recorded).
     #[error("{}", fmt_src_err(name, *line, *col, message))]
     Parse {
         /// Source of the template (e.g. file name) if known.

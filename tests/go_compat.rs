@@ -5360,3 +5360,25 @@ fn test_leading_zero_integer_with_8_or_9_fails() {
     ok("{{09.5}}", &Value::Nil, "9.5");
     ok("{{017}}", &Value::Nil, "15");
 }
+
+#[test]
+fn test_parse_errors_use_go_format_and_wording() {
+    let err = |src: &str| match Template::new("t").parse(src) {
+        Ok(_) => panic!("{src:?} should not parse"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(err("a {{.X"), "template: t:1: unclosed action");
+    assert_eq!(
+        err(r#"{{"abc}}"#),
+        "template: t:1: unterminated quoted string"
+    );
+    assert_eq!(err("{{}}"), "template: t:1: missing value for command");
+    assert_eq!(err("x\n{{if}}"), "template: t:2: missing value for if");
+    assert_eq!(
+        err("{{nope 1}}"),
+        r#"template: t:1: function "nope" not defined"#
+    );
+    assert_eq!(err("{{$x}}"), r#"template: t:1: undefined variable "$x""#);
+    fail("{{nope 1}}", &Value::Nil);
+    fail("{{if true}}{{$x := 1}}{{end}}{{$x}}", &Value::Nil);
+}

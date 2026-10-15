@@ -96,7 +96,7 @@ impl<'a> Parser<'a> {
 
     /// Like [`new`](Self::new) but tags the parser with a source name (typically
     /// a file path) that is prefixed onto lex and parse error messages, matching
-    /// Go's `template: <name>:<line>:<col>: <message>` format.
+    /// Go's `template: <name>:<line>: <message>` format.
     ///
     /// The name is borrowed for the parser's lifetime and only copied into the
     /// error's owned `String` when an error is actually emitted.
@@ -309,7 +309,7 @@ impl<'a> Parser<'a> {
                             defines.push(def);
                         }
                         _ => {
-                            let pipe = self.parse_pipeline(true)?;
+                            let pipe = self.parse_pipeline(true, "command")?;
                             self.expect_close_delim()?;
                             nodes.push(Node::Action(ActionNode {
                                 pos: pipe.pos,
@@ -334,11 +334,12 @@ impl<'a> Parser<'a> {
         &mut self,
         defines: &mut Vec<DefineNode>,
         allow_multi_decl: bool,
+        keyword: &str,
     ) -> Result<BranchNode> {
         let pos = self.cur_pos();
         self.next();
 
-        let pipe = self.parse_pipeline_full(true, allow_multi_decl)?;
+        let pipe = self.parse_pipeline_full(true, allow_multi_decl, keyword)?;
         self.expect_close_delim()?;
 
         let body = self.parse_list(defines)?;
@@ -388,15 +389,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_if(&mut self, defines: &mut Vec<DefineNode>) -> Result<Node> {
-        Ok(Node::If(self.parse_branch(defines, false)?))
+        Ok(Node::If(self.parse_branch(defines, false, "if")?))
     }
 
     fn parse_range(&mut self, defines: &mut Vec<DefineNode>) -> Result<Node> {
-        Ok(Node::Range(self.parse_branch(defines, true)?))
+        Ok(Node::Range(self.parse_branch(defines, true, "range")?))
     }
 
     fn parse_with(&mut self, defines: &mut Vec<DefineNode>) -> Result<Node> {
-        Ok(Node::With(self.parse_branch(defines, false)?))
+        Ok(Node::With(self.parse_branch(defines, false, "with")?))
     }
 
     fn parse_define(&mut self, defines: &mut Vec<DefineNode>) -> Result<DefineNode> {
@@ -431,7 +432,7 @@ impl<'a> Parser<'a> {
         let pipe = if self.peek().kind != TokenKind::RightDelim
             && self.peek().kind != TokenKind::RightTrimDelim
         {
-            Some(self.parse_pipeline(false)?)
+            Some(self.parse_pipeline(false, "template clause")?)
         } else {
             None
         };
@@ -457,7 +458,7 @@ impl<'a> Parser<'a> {
         let pipe = if self.peek().kind != TokenKind::RightDelim
             && self.peek().kind != TokenKind::RightTrimDelim
         {
-            Some(self.parse_pipeline(false)?)
+            Some(self.parse_pipeline(false, "template clause")?)
         } else {
             None
         };
@@ -479,14 +480,16 @@ impl<'a> Parser<'a> {
     }
 
     // Pipeline and command parsing
-    fn parse_pipeline(&mut self, allow_decl: bool) -> Result<PipeNode> {
-        self.parse_pipeline_full(allow_decl, false)
+    /// `context` names the construct for Go's "missing value for <context>" error.
+    fn parse_pipeline(&mut self, allow_decl: bool, context: &str) -> Result<PipeNode> {
+        self.parse_pipeline_full(allow_decl, false, context)
     }
 
     fn parse_pipeline_full(
         &mut self,
         allow_decl: bool,
         allow_multi_decl: bool,
+        context: &str,
     ) -> Result<PipeNode> {
         let pos = self.cur_pos();
         let mut decl = Vec::new();
@@ -516,6 +519,13 @@ impl<'a> Parser<'a> {
             } else {
                 self.pos = saved;
             }
+        }
+
+        if matches!(
+            self.peek().kind,
+            TokenKind::RightDelim | TokenKind::RightTrimDelim | TokenKind::RightParen
+        ) {
+            return Err(self.error(format!("missing value for {context}")));
         }
 
         if !allow_multi_decl && decl.len() > 1 {
@@ -565,7 +575,7 @@ impl<'a> Parser<'a> {
                     let paren_pos = self.cur_pos();
                     self.next();
                     self.enter()?;
-                    let pipe_result = self.parse_pipeline(false);
+                    let pipe_result = self.parse_pipeline(false, "parenthesized pipeline");
                     self.leave();
                     let pipe = pipe_result?;
                     self.expect(TokenKind::RightParen)?;

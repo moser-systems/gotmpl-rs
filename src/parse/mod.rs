@@ -12,6 +12,7 @@
 //! use cases like
 //! [`Template::add_parse_tree`](crate::Template::add_parse_tree).
 
+pub(crate) mod check;
 pub(crate) mod lexer;
 pub(crate) mod node;
 mod parser;

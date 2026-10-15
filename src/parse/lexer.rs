@@ -499,7 +499,7 @@ impl<'a> Lexer<'a> {
             self.skip(self.right_delim.len());
             close_trims = false;
         } else {
-            return Err(self.error("comment not terminated by closing delimiter"));
+            return Err(self.error("comment ends before closing delimiter"));
         }
 
         self.ignore();
@@ -569,7 +569,7 @@ impl<'a> Lexer<'a> {
                         self.next_char();
                         self.emit(TokenKind::Declare);
                     } else {
-                        return Err(self.error("expected '=' after ':'"));
+                        return Err(self.error("expected :="));
                     }
                 }
                 '=' => {
@@ -627,7 +627,7 @@ impl<'a> Lexer<'a> {
         self.next_char(); // consume opening "
         loop {
             match self.next_char() {
-                None => return Err(self.error("unterminated string")),
+                None => return Err(self.error("unterminated quoted string")),
                 Some('\\') => {
                     self.next_char();
                 } // skip escaped char
@@ -653,7 +653,7 @@ impl<'a> Lexer<'a> {
         self.next_char(); // consume opening `
         loop {
             match self.next_char() {
-                None => return Err(self.error("unterminated raw string")),
+                None => return Err(self.error("unterminated raw quoted string")),
                 Some('`') => {
                     let raw = self.current_str();
                     let inner = &raw[1..raw.len() - 1];
@@ -818,7 +818,7 @@ impl<'a> Lexer<'a> {
             }
         }
         if !has_digits {
-            return Err(self.error("invalid hex number"));
+            return Err(self.error(format!("bad number syntax: {:?}", self.current_str())));
         }
         // Emit as number but we need to convert to decimal for the value
         let raw = self.current_str();
@@ -875,7 +875,7 @@ impl<'a> Lexer<'a> {
         // Parse hex float manually: use the format 0xHEX.HEXpEXP
         match crate::go::parse_hex_float(&clean) {
             Some(f) => self.emit_num(TokenKind::Number, Number::Float(f)),
-            None => return Err(self.error("invalid hex float")),
+            None => return Err(self.error(format!("bad number syntax: {:?}", self.current_str()))),
         }
         Ok(())
     }
@@ -948,7 +948,7 @@ impl<'a> Lexer<'a> {
         }
 
         if !has_digits {
-            return Err(self.error("invalid number"));
+            return Err(self.error(format!("bad number syntax: {:?}", self.current_str())));
         }
 
         let raw = self.current_str();
@@ -1015,15 +1015,15 @@ impl<'a> Lexer<'a> {
                         char::from(byte)
                     }
                     Some(c) => c,
-                    None => return Err(self.error("unterminated character literal")),
+                    None => return Err(self.error("unterminated character constant")),
                 }
             }
             Some(c) => c,
-            None => return Err(self.error("unterminated character literal")),
+            None => return Err(self.error("unterminated character constant")),
         };
 
         if self.next_char() != Some('\'') {
-            return Err(self.error("unterminated character literal"));
+            return Err(self.error("unterminated character constant"));
         }
 
         // Emit as a number (Go treats char constants as their Unicode code point)

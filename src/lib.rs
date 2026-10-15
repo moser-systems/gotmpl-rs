@@ -352,6 +352,7 @@ impl Template {
         let parser =
             Parser::with_name(self.parse_name(), src, &self.left_delim, &self.right_delim)?;
         let (tree, defines) = parser.parse()?;
+        self.check_names(&tree, &defines, src, self.parse_name())?;
 
         // Go's `parse.(*Tree).add` rejects a non-empty top-level that collides
         // with a same-named non-empty `{{define}}` in the same parse call:
@@ -387,9 +388,34 @@ impl Template {
         Ok(self)
     }
 
+    /// Go resolves function and variable names at parse time; reject a tree
+    /// that uses an undefined function or an undeclared variable.
+    fn check_names(
+        &self,
+        tree: &ListNode,
+        defines: &[DefineNode],
+        src: &str,
+        parse_name: Option<&str>,
+    ) -> Result<()> {
+        let funcs = &self.funcs;
+        match crate::parse::check::check(tree, defines, &|name| funcs.contains_key(name)) {
+            None => Ok(()),
+            Some(unresolved) => {
+                let before = src.get(..unresolved.pos.offset).unwrap_or(src);
+                let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+                Err(error::TemplateError::Parse {
+                    name: parse_name.map(String::from),
+                    line: unresolved.pos.line,
+                    col,
+                    message: unresolved.message,
+                })
+            }
+        }
+    }
+
     /// The template's name as a parser tag, or `None` when empty. Matches Go's
     /// `parseName` handling: an unnamed template drops the name segment from
-    /// error displays rather than rendering as `template: :<line>:<col>: …`.
+    /// error displays rather than rendering as `template: :<line>: …`.
     fn parse_name(&self) -> Option<&str> {
         (!self.name.is_empty()).then_some(self.name.as_str())
     }
@@ -548,7 +574,7 @@ impl Template {
 
             // Tag the parser with the basename so parse/lex errors report
             // the originating file (Go's parseName), matching its
-            // `template: foo.tmpl:12:5: …` format.
+            // `template: foo.tmpl:12: …` format.
             let parser = Parser::with_name(
                 Some(basename),
                 &content,
@@ -556,6 +582,7 @@ impl Template {
                 &self.right_delim,
             )?;
             let (tree, defines) = parser.parse()?;
+            self.check_names(&tree, &defines, &content, Some(basename))?;
 
             // Go parity: if the basename matches the receiver's name, the file's
             // top-level content becomes the receiver's own tree (so `Execute` works
@@ -1459,7 +1486,7 @@ mod tests {
             }
             other => panic!("expected Parse error, got {other:?}"),
         }
-        // Display format matches Go's `template: <name>:<line>:<col>: <msg>` prefix.
+        // Display format matches Go's `template: <name>:<line>: <msg>` prefix.
         let s = err.to_string();
         assert!(
             s.starts_with("template: broken.tmpl:"),
@@ -1472,7 +1499,7 @@ mod tests {
     #[test]
     fn test_parse_error_without_name_drops_name_segment() {
         // Template::new("") -> empty name, so parse() leaves the error untagged
-        // and the display format omits the name segment: `template: <line>:<col>: …`.
+        // and the display format omits the name segment: `template: <line>: …`.
         let err = Template::new("").parse("{{if}}").err().unwrap();
         let s = err.to_string();
         assert!(s.starts_with("template: "), "got: {s}");
@@ -1516,7 +1543,7 @@ mod tests {
             }
             other => panic!("expected Lex error, got {other:?}"),
         }
-        // Shares the Parse variant's `template: <name>:<line>:<col>:` prefix.
+        // Shares the Parse variant's `template: <name>:<line>:` prefix.
         assert!(err.to_string().starts_with("template: t:2:"));
     }
 
