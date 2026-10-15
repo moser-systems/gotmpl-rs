@@ -17,7 +17,17 @@
 //! Go templates access exported PascalCase fields (`{{.Name}}`), but serde
 //! derives field names verbatim from the Rust identifiers (`name`). Add
 //! `#[serde(rename_all = "PascalCase")]` (or a per-field `#[serde(rename = "...")]`)
-//! so the map keys match what the template dots into.
+//! so the field names match what the template dots into.
+//!
+//! # Structs
+//!
+//! A struct with named fields becomes a [`Value::Struct`]: it keeps the
+//! declaration order, prints as Go does (`{a b}`, `{A:a B:b}` with `%+v`), and
+//! an unknown field is an error, as for a Go struct. serde's struct name is the
+//! Go type name in error messages (`can't evaluate field X in type User`);
+//! `#[serde(rename = "main.User")]` sets it. Fields skipped by
+//! `skip_serializing_if` are absent. `#[serde(flatten)]` serializes through
+//! serde's map path and so produces a [`Value::Map`].
 //!
 //! # Map keys
 //!
@@ -54,7 +64,7 @@ use serde::Serialize;
 use serde::ser::{self, Impossible};
 
 use crate::error::{Result, TemplateError};
-use crate::value::Value;
+use crate::value::{StructValue, Value};
 
 /// Convert a [`serde::Serialize`] value into a template [`Value`].
 ///
@@ -124,7 +134,7 @@ impl ser::Serializer for ValueSerializer {
     type SerializeTupleStruct = SerializeVec;
     type SerializeTupleVariant = SerializeTupleVariant;
     type SerializeMap = SerializeMap;
-    type SerializeStruct = SerializeMap;
+    type SerializeStruct = SerializeStruct;
     type SerializeStructVariant = SerializeStructVariant;
 
     serialize_int! {
@@ -256,10 +266,10 @@ impl ser::Serializer for ValueSerializer {
         })
     }
 
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<SerializeMap> {
-        Ok(SerializeMap {
-            map: BTreeMap::new(),
-            next_key: None,
+    fn serialize_struct(self, name: &'static str, len: usize) -> Result<SerializeStruct> {
+        Ok(SerializeStruct {
+            name,
+            fields: Vec::with_capacity(len),
         })
     }
 
@@ -351,7 +361,7 @@ impl ser::SerializeTupleVariant for SerializeTupleVariant {
     }
 }
 
-/// Accumulator for maps and structs → [`Value::Map`].
+/// Accumulator for maps → [`Value::Map`].
 struct SerializeMap {
     map: BTreeMap<Arc<str>, Value>,
     next_key: Option<Arc<str>>,
@@ -379,7 +389,14 @@ impl ser::SerializeMap for SerializeMap {
     }
 }
 
-impl ser::SerializeStruct for SerializeMap {
+/// Accumulator for structs → [`Value::Struct`], keeping field order and
+/// serde's struct name as the Go type name.
+struct SerializeStruct {
+    name: &'static str,
+    fields: Vec<(&'static str, Value)>,
+}
+
+impl ser::SerializeStruct for SerializeStruct {
     type Ok = Value;
     type Error = TemplateError;
 
@@ -388,12 +405,16 @@ impl ser::SerializeStruct for SerializeMap {
         key: &'static str,
         value: &T,
     ) -> Result<()> {
-        self.map.insert(Arc::from(key), to_value(value)?);
+        self.fields.push((key, to_value(value)?));
+        Ok(())
+    }
+
+    fn skip_field(&mut self, _key: &'static str) -> Result<()> {
         Ok(())
     }
 
     fn end(self) -> Result<Value> {
-        Ok(self.map.into())
+        Ok(StructValue::new(self.name, self.fields).into())
     }
 }
 
@@ -553,6 +574,11 @@ mod tests {
         ))
     }
 
+    /// Build a `Value::Struct` from a type name and ordered fields.
+    fn strct<const N: usize>(name: &str, fields: [(&str, Value); N]) -> Value {
+        StructValue::new(name, fields).into()
+    }
+
     #[test]
     fn scalars() {
         assert_eq!(to_value(&true).unwrap(), Value::Bool(true));
@@ -596,16 +622,64 @@ mod tests {
 
         assert_eq!(
             v,
-            map([
-                ("Name", Value::String("Alice".into())),
-                ("Age", Value::Uint(30)),
-                (
-                    "Tags",
-                    Value::List(vec![Value::String("a".into()), Value::String("b".into())].into())
-                ),
-                ("Address", map([("City", Value::String("Paris".into()))])),
-                ("Nickname", Value::Nil),
-            ])
+            strct(
+                "User",
+                [
+                    ("Name", Value::String("Alice".into())),
+                    ("Age", Value::Uint(30)),
+                    (
+                        "Tags",
+                        Value::List(
+                            vec![Value::String("a".into()), Value::String("b".into())].into()
+                        )
+                    ),
+                    (
+                        "Address",
+                        strct("Address", [("City", Value::String("Paris".into()))])
+                    ),
+                    ("Nickname", Value::Nil),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn struct_keeps_go_type_name_and_field_order() {
+        #[derive(Serialize)]
+        #[serde(rename = "main.Task")]
+        struct Task {
+            #[serde(rename = "Name")]
+            name: &'static str,
+            #[serde(rename = "CPU")]
+            cpu: i64,
+            #[serde(rename = "Driver", skip_serializing_if = "Option::is_none")]
+            driver: Option<&'static str>,
+        }
+
+        let v = to_value(&Task {
+            name: "web",
+            cpu: 500,
+            driver: None,
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            strct(
+                "main.Task",
+                [("Name", Value::from("web")), ("CPU", Value::Int(500))]
+            )
+        );
+        assert_eq!(v.type_name(), "main.Task");
+        assert_eq!(v.to_string(), "{web 500}");
+        let err = Template::new("t")
+            .parse("{{.Driver}}")
+            .unwrap()
+            .execute_to_string(&v)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("can't evaluate field Driver in type main.Task"),
+            "{err}"
         );
     }
 

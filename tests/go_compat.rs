@@ -14,7 +14,7 @@ extern crate alloc;
 // Additional Rust-only edge-case tests may appear here when needed to guard
 // behavior parity with upstream Go tests.
 
-use gotmpl::Value;
+use gotmpl::{StructValue, ToValue, Value};
 use gotmpl::{Template, tmap};
 
 // Go cross-check
@@ -110,6 +110,20 @@ mod go_crosscheck {
                     entries.push(format!(r#""{}":{}"#, json_escape(k), v_json));
                 }
                 format!(r#"{{"type":"map","map":{{{}}}}}"#, entries.join(","))
+            }
+            // Go builds an anonymous struct type with the same fields, so
+            // formatting matches but type names in errors do not.
+            Value::Struct(st) => {
+                let mut fields = Vec::new();
+                for (k, v) in st.fields() {
+                    let v_json = value_to_json(v)?;
+                    fields.push(format!(
+                        r#"{{"name":"{}","value":{}}}"#,
+                        json_escape(k),
+                        v_json
+                    ));
+                }
+                format!(r#"{{"type":"struct","fields":[{}]}}"#, fields.join(","))
             }
             Value::Function(_) => {
                 return Err("Value::Function cannot be serialized for cross-check; use \
@@ -5418,5 +5432,169 @@ fn test_printf_capital_o_has_0o_prefix() {
         r#"{{printf "%O %O %#O %6O" 8 -8 8 8}}"#,
         &Value::Nil,
         "0o10 -0o10 0o010   0o10",
+    );
+}
+
+fn task_struct(name: &str, cpu: i64) -> Value {
+    StructValue::new(
+        "main.Task",
+        [
+            ("Name", Value::from(name)),
+            ("CPU", Value::Int(cpu)),
+            ("Weight", Value::Float(1.5)),
+            ("Env", tmap! { "MODE" => "prod" }),
+            ("Tags", vec!["a".to_string(), "b".to_string()].to_value()),
+        ],
+    )
+    .into()
+}
+
+fn point(x: i64, y: i64) -> Value {
+    StructValue::new("main.Point", [("X", Value::Int(x)), ("Y", Value::Int(y))]).into()
+}
+
+#[test]
+fn test_struct_formats_like_go() {
+    let job: Value = StructValue::new(
+        "main.Job",
+        [
+            ("ID", Value::from("web")),
+            (
+                "Tasks",
+                Value::List(vec![task_struct("server", 500), task_struct("sidecar", 100)].into()),
+            ),
+            ("Meta", tmap! { "at" => point(1, 2) }),
+            (
+                "Empty",
+                StructValue::new("main.Empty", Vec::<(&str, Value)>::new()).into(),
+            ),
+        ],
+    )
+    .into();
+    ok(
+        "{{.}}",
+        &task_struct("server", 500),
+        "{server 500 1.5 map[MODE:prod] [a b]}",
+    );
+    ok(
+        "{{.}}",
+        &job,
+        "{web [{server 500 1.5 map[MODE:prod] [a b]} {sidecar 100 1.5 map[MODE:prod] [a b]}] map[at:{1 2}] {}}",
+    );
+    ok(
+        r#"{{printf "%+v" .}}"#,
+        &job,
+        "{ID:web Tasks:[{Name:server CPU:500 Weight:1.5 Env:map[MODE:prod] Tags:[a b]} \
+         {Name:sidecar CPU:100 Weight:1.5 Env:map[MODE:prod] Tags:[a b]}] Meta:map[at:{X:1 Y:2}] Empty:{}}",
+    );
+    ok(
+        r#"{{printf "%v|%s" .Meta .Meta}}"#,
+        &job,
+        "map[at:{1 2}]|map[at:{%!s(int=1) %!s(int=2)}]",
+    );
+    ok(
+        r#"{{printf "%s" .}}"#,
+        &task_struct("server", 500),
+        "{server %!s(int=500) %!s(float64=1.5) map[MODE:prod] [a b]}",
+    );
+    ok(r#"{{printf "%s" (index .Tasks 0).Tags}}"#, &job, "[a b]");
+    ok("{{print .Empty}}|{{.Empty}}", &job, "{}|{}");
+}
+
+#[test]
+fn test_struct_fields_and_truth() {
+    let task = task_struct("server", 500);
+    ok(
+        "{{.Name}} {{.CPU}} {{.Env.MODE}} {{index .Tags 1}}",
+        &task,
+        "server 500 prod b",
+    );
+    ok("{{with .}}{{.Name}}{{end}}", &task, "server");
+    let empty: Value = StructValue::new("main.Empty", Vec::<(&str, Value)>::new()).into();
+    ok("{{if .}}true{{else}}false{{end}}", &empty, "true");
+    ok(
+        "{{range .}}{{.Name}},{{end}}",
+        &Value::List(vec![task.clone(), task_struct("b", 1)].into()),
+        "server,b,",
+    );
+}
+
+#[test]
+fn test_struct_comparison() {
+    let data = tmap! {
+        "A" => point(1, 2),
+        "B" => point(1, 2),
+        "C" => point(3, 4),
+        "T" => task_struct("server", 500),
+    };
+    ok(
+        "{{eq .A .B}} {{eq .A .C}} {{ne .A .C}} {{eq .A .B .C}}",
+        &data,
+        "true false true true",
+    );
+    fail("{{eq .T .T}}", &data);
+    fail("{{eq .A .T}}", &data);
+    fail("{{lt .A .B}}", &data);
+    fail("{{eq .A .T.Tags}}", &data);
+    fail("{{eq .A 1}}", &data);
+}
+
+#[test]
+fn test_struct_errors() {
+    let task = task_struct("server", 500);
+    fail("{{.Nope}}", &task);
+    fail("{{len .}}", &task);
+    fail("{{index . 0}}", &task);
+    fail(r#"{{index . "Name"}}"#, &task);
+    fail("{{range .}}x{{end}}", &task);
+    fail("{{slice .}}", &task);
+}
+
+#[test]
+fn test_struct_error_messages_name_the_go_type() {
+    let render = |src: &str, data: &Value, zero: bool| {
+        let mut t = Template::new("t");
+        if zero {
+            t = t.missing_key(gotmpl::MissingKey::ZeroValue);
+        }
+        t.parse(src)
+            .unwrap()
+            .execute_to_string(data)
+            .unwrap_err()
+            .to_string()
+    };
+    let task = task_struct("server", 500);
+    let at =
+        |node: &str, msg: &str| format!(r#"template: t:1:2: executing "t" at <{node}>: {msg}"#);
+    assert_eq!(
+        render("{{.Nope}}", &task, false),
+        at(".Nope", "can't evaluate field Nope in type main.Task")
+    );
+    assert_eq!(
+        render("{{.Nope}}", &task, true),
+        at(".Nope", "can't evaluate field Nope in type main.Task")
+    );
+    assert_eq!(
+        render("{{len .}}", &task, false),
+        at("len .", "error calling len: len of type main.Task")
+    );
+    assert_eq!(
+        render("{{index . 0}}", &task, false),
+        at(
+            "index . 0",
+            "error calling index: can't index item of type main.Task"
+        )
+    );
+    assert_eq!(
+        render("{{lt . .}}", &task, false),
+        at("lt . .", "error calling lt: invalid type for comparison")
+    );
+    assert_eq!(
+        render("{{eq . .}}", &task, false),
+        at(
+            "eq . .",
+            "error calling eq: non-comparable type {server %!s(int=500) %!s(float64=1.5) \
+             map[MODE:prod] [a b]}: main.Task"
+        )
     );
 }

@@ -106,6 +106,14 @@ pub enum Value {
     /// and to let `{{range}}` over a map refcount-bump the key into
     /// [`Value::String`] instead of allocating.
     Map(Arc<BTreeMap<Arc<str>, Value>>),
+    /// A Go struct: a type name and named fields in declaration order.
+    ///
+    /// Produced by [`to_value`](crate::to_value) for every Rust struct with
+    /// named fields. Unlike a [`Value::Map`], a struct formats as Go does
+    /// (`{a b}`, or `{A:a B:b}` with `%+v`), keeps its field order, is always
+    /// truthy, and reports an unknown field as an error regardless of the
+    /// [`MissingKey`](crate::MissingKey) option.
+    Struct(Arc<StructValue>),
     /// A callable function value, invoked via the `call` builtin.
     ///
     /// See [`ValueFunc`] for the expected signature.
@@ -124,6 +132,77 @@ pub enum Value {
         /// The trusted string, emitted verbatim in its matching context.
         s: Arc<str>,
     },
+}
+
+/// The data of a [`Value::Struct`]: a Go type name (as printed in error
+/// messages, e.g. `main.Job`) and the fields in declaration order.
+///
+/// # Examples
+///
+/// ```
+/// use gotmpl::{StructValue, Value};
+///
+/// let task = Value::from(StructValue::new(
+///     "main.Task",
+///     [("Name", Value::from("web")), ("CPU", Value::Int(500))],
+/// ));
+/// assert_eq!(task.to_string(), "{web 500}");
+/// assert_eq!(task.field("CPU"), Some(&Value::Int(500)));
+/// assert_eq!(task.type_name(), "main.Task");
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructValue {
+    type_name: Arc<str>,
+    fields: Vec<(Arc<str>, Value)>,
+}
+
+impl StructValue {
+    /// Creates a struct value from its type name and fields in declaration order.
+    pub fn new<N, K, I>(type_name: N, fields: I) -> Self
+    where
+        N: Into<Arc<str>>,
+        K: Into<Arc<str>>,
+        I: IntoIterator<Item = (K, Value)>,
+    {
+        StructValue {
+            type_name: type_name.into(),
+            fields: fields.into_iter().map(|(k, v)| (k.into(), v)).collect(),
+        }
+    }
+
+    /// The Go type name, e.g. `main.Job`.
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// The fields in declaration order.
+    pub fn fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.fields.iter().map(|(k, v)| (k.as_ref(), v))
+    }
+
+    /// Looks up a field by name.
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.fields
+            .iter()
+            .find(|(k, _)| k.as_ref() == name)
+            .map(|(_, v)| v)
+    }
+
+    /// Whether Go's `==` is defined for this struct: no field (recursively)
+    /// is a slice, map or function.
+    pub(crate) fn is_comparable(&self) -> bool {
+        self.fields.iter().all(|(_, v)| match v {
+            Value::List(_) | Value::Map(_) | Value::Function(_) => false,
+            Value::Struct(s) => s.is_comparable(),
+            _ => true,
+        })
+    }
+}
+
+impl From<StructValue> for Value {
+    fn from(s: StructValue) -> Self {
+        Value::Struct(Arc::new(s))
+    }
 }
 
 /// The content type of a [`Value::Safe`] — the seven trusted-content kinds of
@@ -160,6 +239,7 @@ impl Clone for Value {
             Value::String(s) => Value::String(Arc::clone(s)),
             Value::List(v) => Value::List(Arc::clone(v)),
             Value::Map(m) => Value::Map(Arc::clone(m)),
+            Value::Struct(s) => Value::Struct(Arc::clone(s)),
             Value::Function(f) => Value::Function(Arc::clone(f)),
             #[cfg(feature = "html")]
             Value::Safe { kind, s } => Value::Safe {
@@ -181,6 +261,7 @@ impl fmt::Debug for Value {
             Value::String(s) => write!(f, "String({s:?})"),
             Value::List(v) => write!(f, "List({v:?})"),
             Value::Map(m) => write!(f, "Map({m:?})"),
+            Value::Struct(s) => write!(f, "Struct({s:?})"),
             Value::Function(_) => write!(f, "Function(...)"),
             #[cfg(feature = "html")]
             Value::Safe { kind, s } => write!(f, "Safe({kind:?}, {s:?})"),
@@ -202,13 +283,14 @@ impl Value {
             Value::String(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
             Value::Map(m) => !m.is_empty(),
-            Value::Function(_) => true,
+            // Go: a struct is always true.
+            Value::Struct(_) | Value::Function(_) => true,
             #[cfg(feature = "html")]
             Value::Safe { s, .. } => !s.is_empty(),
         }
     }
 
-    /// Look up a field by name on a [`Value::Map`].
+    /// Look up a field by name on a [`Value::Map`] or [`Value::Struct`].
     ///
     /// Returns `Some(&value)` when the key exists (the value may itself be
     /// [`Value::Nil`]), and `None` when the key is absent or the receiver is
@@ -233,6 +315,7 @@ impl Value {
     pub fn field(&self, name: &str) -> Option<&Value> {
         match self {
             Value::Map(m) => m.get(name),
+            Value::Struct(s) => s.get(name),
             _ => None,
         }
     }
@@ -309,8 +392,9 @@ impl Value {
         }
     }
 
-    /// Returns a short type name for use in error messages.
-    pub fn type_name(&self) -> &'static str {
+    /// Returns a short type name for use in error messages; a struct's Go
+    /// type name (e.g. `main.Job`).
+    pub fn type_name(&self) -> &str {
         match self {
             Value::Nil => "nil",
             Value::Bool(_) => "bool",
@@ -320,6 +404,7 @@ impl Value {
             Value::String(_) => "string",
             Value::List(_) => "list",
             Value::Map(_) => "map",
+            Value::Struct(s) => s.type_name(),
             Value::Function(_) => "func",
             // Safe content compares and formats as its underlying string, so it
             // reports "string" (matching Go's basicKind for template.HTML etc.).
@@ -462,6 +547,74 @@ impl Value {
     }
 }
 
+/// The Go `fmt` verbs that format lists, maps and structs element-wise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoVerb {
+    /// `%v`
+    V,
+    /// `%+v`: adds field names to structs, at any depth.
+    PlusV,
+    /// `%s`: non-string elements print as `%!s(type=value)`.
+    S,
+}
+
+impl Value {
+    /// Formats the value as Go's `fmt` does for `verb`, applying the verb to
+    /// every element of a list, map or struct.
+    pub(crate) fn write_go(&self, f: &mut dyn fmt::Write, verb: GoVerb) -> fmt::Result {
+        let plus = verb == GoVerb::PlusV;
+        match self {
+            Value::List(v) => {
+                f.write_char('[')?;
+                for (i, item) in v.iter().enumerate() {
+                    if i > 0 {
+                        f.write_char(' ')?;
+                    }
+                    item.write_go(f, verb)?;
+                }
+                f.write_char(']')
+            }
+            Value::Map(m) => {
+                f.write_str("map[")?;
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        f.write_char(' ')?;
+                    }
+                    write!(f, "{k}:")?;
+                    v.write_go(f, verb)?;
+                }
+                f.write_char(']')
+            }
+            Value::Struct(s) => {
+                f.write_char('{')?;
+                for (i, (k, v)) in s.fields().enumerate() {
+                    if i > 0 {
+                        f.write_char(' ')?;
+                    }
+                    if plus {
+                        write!(f, "{k}:")?;
+                    }
+                    v.write_go(f, verb)?;
+                }
+                f.write_char('}')
+            }
+            Value::String(_) => write!(f, "{self}"),
+            #[cfg(feature = "html")]
+            Value::Safe { .. } => write!(f, "{self}"),
+            Value::Nil if verb == GoVerb::S => f.write_str("%!s(<nil>)"),
+            other if verb == GoVerb::S => write!(f, "%!s({}={other})", other.type_name()),
+            other => write!(f, "{other}"),
+        }
+    }
+
+    /// Go's `%s` of the value, as a string.
+    pub(crate) fn go_s(&self) -> String {
+        let mut out = String::new();
+        let _ = self.write_go(&mut out, GoVerb::S);
+        out
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -476,26 +629,7 @@ impl fmt::Display for Value {
                 f.write_str(&s)
             }
             Value::String(s) => write!(f, "{s}"),
-            Value::List(v) => {
-                write!(f, "[")?;
-                for (i, item) in v.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{item}")?;
-                }
-                write!(f, "]")
-            }
-            Value::Map(m) => {
-                write!(f, "map[")?;
-                for (i, (k, v)) in m.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{k}:{v}")?;
-                }
-                write!(f, "]")
-            }
+            Value::List(_) | Value::Map(_) | Value::Struct(_) => self.write_go(f, GoVerb::V),
             Value::Function(_) => write!(f, "<func>"),
             // Trusted content renders verbatim, exactly like its string.
             #[cfg(feature = "html")]
@@ -522,6 +656,7 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Struct(a), Value::Struct(b)) => a == b,
             #[cfg(feature = "html")]
             (Value::Safe { kind: k1, s: a }, Value::Safe { kind: k2, s: b }) => k1 == k2 && a == b,
             _ => false,

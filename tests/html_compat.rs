@@ -86,6 +86,9 @@ mod go_crosscheck {
                 format!(r#"{{"type":"float","value":{s}}}"#)
             }
             Value::String(s) => format!(r#"{{"type":"string","value":"{}"}}"#, json_escape(s)),
+            Value::Struct(_) => {
+                return Err("Value::Struct is not used in the html cross-check".into());
+            }
             Value::Safe { kind, s } => format!(
                 r#"{{"type":"safe","kind":"{}","value":"{}"}}"#,
                 safe_kind_tag(*kind),

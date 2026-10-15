@@ -85,7 +85,7 @@ pub use go::{html_escape, js_escape, url_encode};
 pub use ser::{ToSerdeValue, to_value};
 #[cfg(feature = "html")]
 pub use value::SafeKind;
-pub use value::{ToValue, Value, ValueFunc};
+pub use value::{StructValue, ToValue, Value, ValueFunc};
 
 use alloc::collections::BTreeMap;
 use alloc::format;

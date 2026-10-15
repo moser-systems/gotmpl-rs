@@ -388,6 +388,22 @@ fn compare_eq(left: &Value, right: &Value) -> Result<bool> {
         (Value::Uint(a), Value::Int(b)) => Ok(*b >= 0 && *a == *b as u64),
         (Value::Float(a), Value::Float(b)) => Ok(a == b),
         (Value::String(a), Value::String(b)) => Ok(a == b),
+        // Go compares structs with `==`, which needs the right operand's type
+        // to be comparable; structs of different types are unequal.
+        (Value::Struct(_), Value::Struct(b)) if !b.is_comparable() => Err(TemplateError::Exec(
+            format!("non-comparable type {}: {}", right.go_s(), b.type_name()),
+        )),
+        // A struct and a list or map share Go's non-basic comparison path,
+        // which rejects operands of different kinds.
+        (Value::Struct(_), Value::List(_) | Value::Map(_))
+        | (Value::List(_) | Value::Map(_), Value::Struct(_)) => Err(TemplateError::Exec(format!(
+            "non-comparable types {}: {}, {}: {}",
+            left.go_s(),
+            left.type_name(),
+            right.type_name(),
+            right.go_s()
+        ))),
+        (Value::Struct(a), Value::Struct(b)) => Ok(a == b),
         (Value::List(_), Value::List(_))
         | (Value::Map(_), Value::Map(_))
         | (Value::Function(_), Value::Function(_)) => Err(TemplateError::Exec(format!(
@@ -444,6 +460,10 @@ fn compare_order(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Safe { s: a, .. }, Value::String(b)) => Ok(a.cmp(b)),
         #[cfg(feature = "html")]
         (Value::String(a), Value::Safe { s: b, .. }) => Ok(a.cmp(b)),
+        // Go's ordering builtins only accept basic kinds.
+        (Value::Struct(_), _) | (_, Value::Struct(_)) => {
+            Err(TemplateError::Exec("invalid type for comparison".into()))
+        }
         _ if left.type_name() != right.type_name() => Err(TemplateError::Exec(format!(
             "incompatible types for comparison: {} and {}",
             left.type_name(),

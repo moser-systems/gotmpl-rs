@@ -129,10 +129,20 @@ fn range_over_numeric_key_map_is_lexically_sorted() {
 }
 
 #[test]
-fn index_into_serialized_map_and_vec() {
+fn index_into_serialized_vec_but_not_struct() {
     let data = to_value(&sample_user()).unwrap();
     assert_eq!(render(r#"{{index .Roles 1}}"#, &data), "user");
-    assert_eq!(render(r#"{{index .Address "City"}}"#, &data), "Paris");
+    // A struct is not indexable in Go, unlike a map.
+    let err = Template::new("t")
+        .parse(r#"{{index .Address "City"}}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .ends_with("error calling index: can't index item of type Address"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -193,12 +203,35 @@ fn top_level_vec_of_structs() {
 }
 
 #[test]
-fn missing_field_follows_map_semantics() {
-    // serde produces a `Value::Map`, so field access uses *map* semantics, not
-    // struct semantics: a missing key yields the zero value (`<no value>`) by
-    // default (Go's `missingkey=default`) rather than erroring.
+fn missing_field_follows_struct_semantics() {
+    // serde produces a `Value::Struct`, so an unknown field is an error, as
+    // for a Go struct, whatever the missingkey option.
     let data = to_value(&sample_user()).unwrap();
-    assert_eq!(render("{{.DoesNotExist}}", &data), "<no value>");
+    let err = Template::new("t")
+        .parse("{{.DoesNotExist}}")
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .ends_with("can't evaluate field DoesNotExist in type User"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn struct_formats_like_go() {
+    let data = to_value(&sample_user()).unwrap();
+    let plain = render("{{.}}", &data);
+    let named = render(r#"{{printf "%+v" .}}"#, &data);
+    assert!(
+        plain.starts_with('{') && plain.ends_with("<nil>}"),
+        "{plain}"
+    );
+    assert!(
+        named.starts_with("{Name:") && named.contains(" Address:{City:"),
+        "{named}"
+    );
 }
 
 #[test]

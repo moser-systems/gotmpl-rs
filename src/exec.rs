@@ -887,7 +887,7 @@ impl<'a> Executor<'a> {
             None => Err(TemplateError::Exec(format!(
                 "can't evaluate field {} in type {}",
                 name,
-                if from_map {
+                if from_map && !matches!(val, Value::Struct(_)) {
                     "interface {}"
                 } else {
                     val.type_name()
