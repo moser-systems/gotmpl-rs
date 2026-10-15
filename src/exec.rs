@@ -33,7 +33,10 @@ use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::error::{Result, TemplateError};
-use crate::parse::{BranchNode, CommandNode, Expr, ListNode, Node, Number, PipeNode, TemplateNode};
+use crate::exec_context::{Renderer, TreeSource, go_pos, template_name_pos};
+use crate::parse::{
+    BranchNode, CommandNode, Expr, ListNode, Node, Number, PipeNode, Pos, TemplateNode,
+};
 use crate::value::Value;
 use crate::value::ValueFunc;
 
@@ -207,22 +210,18 @@ pub struct Executor<'a> {
     depth: usize,
     missing_key: MissingKey,
     range_iters_remaining: u64,
+    /// Source text per template name, for Go-style error locations.
+    sources: Option<&'a BTreeMap<String, Arc<TreeSource>>>,
+    /// Name of the template currently executing (Go's `state.tmpl`).
+    current: String,
 }
 
-/// Returns a short human-readable name for an expression, used in error messages.
-fn expr_name(expr: &Expr) -> &'static str {
-    match expr {
-        Expr::Dot(_) => "<.>",
-        Expr::Field(_, _) => "<field>",
-        Expr::Variable(_, _, _) => "<variable>",
-        Expr::Identifier(_, _) => "<identifier>",
-        Expr::String(_, _) => "<string>",
-        Expr::Number(_, _) => "<number>",
-        Expr::Bool(_, _) => "<bool>",
-        Expr::Nil(_) => "<nil>",
-        Expr::Pipe(_, _) => "<pipeline>",
-        Expr::Chain(_, _, _) => "<chain>",
-    }
+/// Where a function call appears: as a command (`{{len 3}}`) or as a bare
+/// identifier argument (`{{print now}}`). Go reports call errors at that node.
+#[derive(Clone, Copy)]
+enum CallSite<'n> {
+    Command(&'n CommandNode),
+    Ident(&'n Expr),
 }
 
 /// Execute a range loop body with break/continue handling.
@@ -310,7 +309,61 @@ impl<'a> Executor<'a> {
             depth: 0,
             missing_key: MissingKey::default(),
             range_iters_remaining: DEFAULT_MAX_RANGE_ITERS,
+            sources: None,
+            current: String::new(),
         }
+    }
+
+    /// Provide the templates' source texts and the name of the template being
+    /// executed, so execution errors carry Go's location and node context.
+    pub(crate) fn set_sources(
+        &mut self,
+        sources: &'a BTreeMap<String, Arc<TreeSource>>,
+        name: &str,
+    ) {
+        self.sources = Some(sources);
+        self.current = name.to_string();
+    }
+
+    fn source(&self) -> Option<&TreeSource> {
+        self.sources
+            .and_then(|m| m.get(self.current.as_str()))
+            .map(AsRef::as_ref)
+    }
+
+    fn renderer(&self) -> Renderer<'_> {
+        Renderer {
+            source: self.source(),
+        }
+    }
+
+    /// Attach Go's `executing "name" at <node>` context to an error that does
+    /// not have one yet. The innermost node wins, like Go's `state.at`.
+    fn locate(
+        &self,
+        sig: ExecSignal,
+        pos: Pos,
+        context: impl FnOnce(&Renderer<'_>) -> String,
+    ) -> ExecSignal {
+        match sig {
+            ExecSignal::Err(e) if !matches!(*e, TemplateError::ExecAt { .. }) => {
+                let location = match self.source() {
+                    Some(src) => src.location(pos),
+                    None => format!("{}:{}", self.current, pos.line),
+                };
+                ExecSignal::Err(Box::new(TemplateError::ExecAt {
+                    location,
+                    name: self.current.clone(),
+                    context: context(&self.renderer()),
+                    source: e,
+                }))
+            }
+            other => other,
+        }
+    }
+
+    fn at_expr<T>(&self, expr: &Expr, result: ExecResult<T>) -> ExecResult<T> {
+        result.map_err(|sig| self.locate(sig, go_pos(expr), |r| r.expr(expr)))
     }
 
     /// Set the [`MissingKey`] behavior for this executor.
@@ -539,7 +592,14 @@ impl<'a> Executor<'a> {
                 }
             }
             other => {
-                return Err(TemplateError::NotIterable(other.type_name().to_string()).into());
+                // Go reports the last node evaluated in the range pipeline.
+                let err: ExecSignal = TemplateError::NotIterable(other.to_string()).into();
+                return Err(
+                    match branch.pipe.commands.last().and_then(|c| c.args.first()) {
+                        Some(expr) => self.locate(err, go_pos(expr), |r| r.expr(expr)),
+                        None => err,
+                    },
+                );
             }
         }
 
@@ -572,18 +632,21 @@ impl<'a> Executor<'a> {
             dot.clone()
         };
 
-        let tree = Arc::clone(
-            self.templates
-                .get(tmpl.name.as_str())
-                .ok_or_else(|| TemplateError::UndefinedTemplate(tmpl.name.to_string()))?,
-        );
+        let Some(tree) = self.templates.get(tmpl.name.as_str()).map(Arc::clone) else {
+            let err = TemplateError::UndefinedTemplate(tmpl.name.to_string()).into();
+            let pos = template_name_pos(tmpl, self.source());
+            return Err(self.locate(err, pos, |r| r.template(tmpl)));
+        };
 
         // Template invocations do not inherit the caller's variables. Swap in
         // a fresh scope containing only `$`, matching Go's walkTemplate which
-        // rebuilds `state.vars` as `[{"$", dot}]` before recursing.
+        // rebuilds `state.vars` as `[{"$", dot}]` before recursing. Errors
+        // inside report the callee's name, as Go's `state.tmpl` does.
         let saved = core::mem::replace(&mut self.vars, VarScope::new());
+        let caller = core::mem::replace(&mut self.current, tmpl.name.to_string());
         self.vars.set(&DOLLAR_KEY, new_dot.clone());
         let result = self.walk(w, &tree, &new_dot);
+        self.current = caller;
         self.vars = saved;
         result
     }
@@ -642,7 +705,13 @@ impl<'a> Executor<'a> {
             if name.as_str() == "and" || name.as_str() == "or" {
                 return self.eval_short_circuit(dot, name, &cmd.args[1..], piped);
             }
-            return self.eval_function_call(dot, name, &cmd.args[1..], piped);
+            return self.eval_function_call(
+                dot,
+                name,
+                &cmd.args[1..],
+                piped,
+                CallSite::Command(cmd),
+            );
         }
 
         // If the first arg is a Chain with an Identifier inside, it's a function call
@@ -652,26 +721,28 @@ impl<'a> Executor<'a> {
         {
             if name.as_str() == "and" || name.as_str() == "or" {
                 let val = self.eval_short_circuit(dot, name, &cmd.args[1..], piped)?;
-                return self.walk_fields(val, fields);
+                return self.at_expr(first, self.walk_fields(val, fields));
             }
-            let val = self.eval_function_call(dot, name, &cmd.args[1..], piped)?;
-            return self.walk_fields(val, fields);
+            let val =
+                self.eval_function_call(dot, name, &cmd.args[1..], piped, CallSite::Command(cmd))?;
+            return self.at_expr(first, self.walk_fields(val, fields));
         }
 
         // Non-function command: cannot accept piped values or extra arguments.
         // Go errors with "can't give argument to non-function".
         if piped.is_some() || cmd.args.len() > 1 {
-            return Err(TemplateError::Exec(format!(
+            let err = TemplateError::Exec(format!(
                 "can't give argument to non-function {}",
-                expr_name(first)
-            ))
-            .into());
+                self.renderer().expr(first)
+            ));
+            return self.at_expr(first, Err(err.into()));
         }
 
         // Go: nil is not a valid command. It cannot be printed or used
         // as a pipeline value. It may only appear as an argument to a function.
         if matches!(first, Expr::Nil(_)) {
-            return Err(TemplateError::Exec("nil is not a command".into()).into());
+            let err = TemplateError::Exec("nil is not a command".into());
+            return self.at_expr(first, Err(err.into()));
         }
 
         self.eval_expr(dot, first)
@@ -734,11 +805,12 @@ impl<'a> Executor<'a> {
         name: &str,
         arg_exprs: &[Expr],
         piped: Option<Value>,
+        site: CallSite<'_>,
     ) -> ExecResult<Value> {
-        let func = self
-            .funcs
-            .get(name)
-            .ok_or_else(|| TemplateError::UndefinedFunction(name.to_string()))?;
+        let Some(func) = self.funcs.get(name) else {
+            let err = TemplateError::UndefinedFunction(name.to_string()).into();
+            return Err(self.locate_call(err, site));
+        };
 
         let mut args: Vec<Value> =
             Vec::with_capacity(arg_exprs.len() + usize::from(piped.is_some()));
@@ -751,19 +823,55 @@ impl<'a> Executor<'a> {
             args.push(piped_val);
         }
 
-        self.invoke_func(name, func, &args)
+        // Go's `call` names the callee node in its error.
+        if name == "call"
+            && let (Some(callee), Some(first)) = (arg_exprs.first(), args.first())
+            && !matches!(first, Value::Function(_) | Value::Nil)
+        {
+            let err = TemplateError::Exec(format!(
+                "non-function {} of type {}",
+                self.renderer().expr(callee),
+                first.type_name()
+            ));
+            return Err(self.locate_call(self.calling(name, err.into()), site));
+        }
+
+        let result = self.invoke_func(name, func, &args);
+        result.map_err(|sig| self.locate_call(self.calling(name, sig), site))
+    }
+
+    /// Go wraps a function's error as `error calling <name>: <err>`.
+    fn calling(&self, name: &str, sig: ExecSignal) -> ExecSignal {
+        match sig {
+            ExecSignal::Err(e) if !matches!(*e, TemplateError::ExecAt { .. }) => ExecSignal::Err(
+                Box::new(TemplateError::Exec(format!("error calling {name}: {e}"))),
+            ),
+            other => other,
+        }
+    }
+
+    fn locate_call(&self, sig: ExecSignal, site: CallSite<'_>) -> ExecSignal {
+        match site {
+            CallSite::Command(cmd) => self.locate(sig, cmd.pos, |r| r.command(cmd)),
+            CallSite::Ident(expr) => self.locate(sig, go_pos(expr), |r| r.expr(expr)),
+        }
     }
 
     /// Walk a chain of field accesses on `val`.
     fn walk_fields(&self, mut val: Value, fields: &[SmolStr]) -> ExecResult<Value> {
+        let mut from_map = false;
         for field in fields {
-            val = self.field_access(&val, field)?;
+            let next = self.field_access(&val, field, from_map)?;
+            from_map = matches!(val, Value::Map(_));
+            val = next;
         }
         Ok(val)
     }
 
-    /// Access a field on a value, respecting missingkey option.
-    fn field_access(&self, val: &Value, name: &str) -> ExecResult<Value> {
+    /// Access a field on a value, respecting missingkey option. `from_map`
+    /// says the value came out of a map: Go then reports its static type,
+    /// `interface {}`, when the field cannot be evaluated.
+    fn field_access(&self, val: &Value, name: &str, from_map: bool) -> ExecResult<Value> {
         match val.field(name) {
             Some(v) => Ok(v.clone()),
             None if matches!(val, Value::Map(_)) => match self.missing_key {
@@ -777,7 +885,11 @@ impl<'a> Executor<'a> {
             None => Err(TemplateError::Exec(format!(
                 "can't evaluate field {} in type {}",
                 name,
-                val.type_name()
+                if from_map {
+                    "interface {}"
+                } else {
+                    val.type_name()
+                }
             ))
             .into()),
         }
@@ -804,15 +916,14 @@ impl<'a> Executor<'a> {
         match expr {
             Expr::Dot(_) => Ok(dot.clone()),
 
-            Expr::Field(_, fields) => self.walk_fields(dot.clone(), fields),
+            Expr::Field(_, fields) => self.at_expr(expr, self.walk_fields(dot.clone(), fields)),
 
             Expr::Variable(_, name, fields) => {
-                let val = self
-                    .vars
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| TemplateError::UndefinedVariable(name.to_string()))?;
-                self.walk_fields(val, fields)
+                let result = match self.vars.get(name).cloned() {
+                    Some(val) => self.walk_fields(val, fields),
+                    None => Err(TemplateError::UndefinedVariable(name.to_string()).into()),
+                };
+                self.at_expr(expr, result)
             }
 
             Expr::String(_, s) => Ok(Value::String(Arc::clone(s))),
@@ -824,7 +935,10 @@ impl<'a> Executor<'a> {
                 // used (its `idealConstant`), so such a literal errors at exec
                 // with "N overflows int" in every context. We match that — uint
                 // *values* (from data) are unaffected; only literals error.
-                Number::Uint(u) => Err(TemplateError::Exec(format!("{u} overflows int")).into()),
+                Number::Uint(u) => self.at_expr(
+                    expr,
+                    Err(TemplateError::Exec(format!("{u} overflows int")).into()),
+                ),
                 Number::Float(f) => Ok(Value::Float(f)),
             },
 
@@ -834,16 +948,13 @@ impl<'a> Executor<'a> {
             Expr::Pipe(_, pipe) => self.eval_pipeline(dot, pipe),
 
             Expr::Identifier(_, name) => {
-                // Bare identifier, could be a zero-arg function call
-                if let Some(func) = self.funcs.get(name.as_str()) {
-                    return self.invoke_func(name, func, &[]);
-                }
-                Err(TemplateError::UndefinedFunction(name.to_string()).into())
+                // Bare identifier: a zero-arg function call.
+                self.eval_function_call(dot, name, &[], None, CallSite::Ident(expr))
             }
 
             Expr::Chain(_, inner, fields) => {
                 let val = self.eval_expr(dot, inner)?;
-                self.walk_fields(val, fields)
+                self.at_expr(expr, self.walk_fields(val, fields))
             }
         }
     }

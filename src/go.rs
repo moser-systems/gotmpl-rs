@@ -759,7 +759,7 @@ fn format_string_hex_into(out: &mut String, s: &str, upper: bool, spec: &FmtSpec
 ///
 /// Escapes backslash, double-quote, newline, tab, carriage-return, bell,
 /// backspace, form-feed, vertical-tab, and all control characters.
-fn go_quote_into(out: &mut String, s: &str) {
+pub(crate) fn go_quote_into(out: &mut String, s: &str) {
     out.reserve(s.len() + 2);
     out.push('"');
     for ch in s.chars() {

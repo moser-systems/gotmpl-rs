@@ -174,8 +174,8 @@ pub fn builtins() -> BTreeMap<String, ValueFunc> {
             match args[0].len() {
                 Some(n) => Ok(Value::Int(n as i64)),
                 None => Err(TemplateError::Exec(format!(
-                    "len: cannot take length of {}",
-                    args[0]
+                    "len of type {}",
+                    args[0].type_name()
                 ))),
             }
         }),

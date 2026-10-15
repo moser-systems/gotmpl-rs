@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub(crate) mod error;
 pub(crate) mod exec;
+pub(crate) mod exec_context;
 pub(crate) mod funcs;
 pub(crate) mod go;
 /// Parser, lexer, and AST node types for the Go template language.
@@ -143,6 +144,9 @@ pub struct Template {
     name: String,
     tree: Option<ListNode>,
     defines: BTreeMap<String, Arc<ListNode>>,
+    /// Source text and parse name of each template body, keyed like
+    /// `defines` (plus this template's own name), for Go-style exec errors.
+    sources: BTreeMap<String, Arc<exec_context::TreeSource>>,
     funcs: Arc<BTreeMap<String, ValueFunc>>,
     left_delim: String,
     right_delim: String,
@@ -195,6 +199,7 @@ impl Template {
             name: name.to_string(),
             tree: None,
             defines: BTreeMap::new(),
+            sources: BTreeMap::new(),
             funcs: shared_builtins(),
             left_delim: "{{".to_string(),
             right_delim: "}}".to_string(),
@@ -353,6 +358,10 @@ impl Template {
             Parser::with_name(self.parse_name(), src, &self.left_delim, &self.right_delim)?;
         let (tree, defines) = parser.parse()?;
         self.check_names(&tree, &defines, src, self.parse_name())?;
+        let source = Arc::new(exec_context::TreeSource {
+            parse_name: self.parse_name().map(String::from),
+            text: Arc::from(src),
+        });
 
         // Go's `parse.(*Tree).add` rejects a non-empty top-level that collides
         // with a same-named non-empty `{{define}}` in the same parse call:
@@ -374,9 +383,10 @@ impl Template {
 
         if self.tree.is_none() || !tree.is_empty_tree() {
             self.tree = Some(tree);
+            self.sources.insert(self.name.clone(), Arc::clone(&source));
         }
 
-        self.merge_defines(defines, src)?;
+        self.merge_defines(defines, src, &source)?;
 
         // Mirror Go's final `AddParseTree` that pairs `t.Tree` with
         // `t.tmpl[t.Name()]`: `self.tree` ends up equal to the entry under
@@ -434,7 +444,12 @@ impl Template {
     /// call. That is what distinguishes "in-call duplicate, error" from
     /// "across-call duplicate, replace": `self.defines` alone can't tell them
     /// apart. `src` is used only for error-position reporting.
-    fn merge_defines(&mut self, defines: Vec<DefineNode>, src: &str) -> Result<()> {
+    fn merge_defines(
+        &mut self,
+        defines: Vec<DefineNode>,
+        src: &str,
+        source: &Arc<exec_context::TreeSource>,
+    ) -> Result<()> {
         let mut seen_non_empty: alloc::collections::BTreeSet<crate::parse::SmolStr> =
             alloc::collections::BTreeSet::new();
         for def in defines {
@@ -459,6 +474,8 @@ impl Template {
             if !new_is_empty {
                 seen_non_empty.insert(def.name.clone());
             }
+            self.sources
+                .insert(def.name.to_string(), Arc::clone(source));
             self.defines
                 .insert(def.name.to_string(), Arc::new(def.body));
         }
@@ -469,10 +486,16 @@ impl Template {
     /// An empty body does not overwrite an existing non-empty define. Used by
     /// [`parse_files`](Self::parse_files) for the basename registration.
     #[cfg(feature = "std")]
-    fn associate_body(&mut self, name: &str, body: ListNode) {
+    fn associate_body(
+        &mut self,
+        name: &str,
+        body: ListNode,
+        source: &Arc<exec_context::TreeSource>,
+    ) {
         if body.is_empty_tree() && self.defines.contains_key(name) {
             return;
         }
+        self.sources.insert(name.to_string(), Arc::clone(source));
         self.defines.insert(name.to_string(), Arc::new(body));
     }
 
@@ -583,6 +606,10 @@ impl Template {
             )?;
             let (tree, defines) = parser.parse()?;
             self.check_names(&tree, &defines, &content, Some(basename))?;
+            let source = Arc::new(exec_context::TreeSource {
+                parse_name: Some(basename.to_string()),
+                text: Arc::from(content.as_str()),
+            });
 
             // Go parity: if the basename matches the receiver's name, the file's
             // top-level content becomes the receiver's own tree (so `Execute` works
@@ -595,13 +622,14 @@ impl Template {
 
             if basename == self.name && (self.tree.is_none() || !tree.is_empty_tree()) {
                 self.tree = Some(tree.clone());
+                self.sources.insert(self.name.clone(), Arc::clone(&source));
             }
             // `associate_body` plays the role of the `parse` pre-populate step:
             // with a non-empty top it seeds `self.defines[basename]` so the
             // subsequent `merge_defines` drops an in-file empty same-name
             // `{{define}}` the same way Go's `parse.(*Tree).add` does.
-            self.associate_body(basename, tree);
-            self.merge_defines(defines, &content)?;
+            self.associate_body(basename, tree, &source);
+            self.merge_defines(defines, &content, &source)?;
 
             // When this file targets the receiver's own slot, pair `self.tree`
             // with the final `self.defines[self.name]` entry (Go's
@@ -752,6 +780,8 @@ impl Template {
     /// ```
     #[must_use]
     pub fn add_parse_tree(mut self, name: &str, tree: ListNode) -> Self {
+        // No source text: errors in this tree report the line only.
+        self.sources.remove(name);
         self.defines.insert(name.to_string(), Arc::new(tree));
         self
     }
@@ -760,11 +790,13 @@ impl Template {
     /// this template's execution options. Single place all execute paths route
     /// through so a new option cannot be forgotten on one of them.
     fn make_executor<'a>(
-        &self,
+        &'a self,
         funcs: &'a BTreeMap<String, ValueFunc>,
         templates: &'a BTreeMap<String, Arc<ListNode>>,
+        name: &str,
     ) -> Executor<'a> {
         let mut executor = Executor::new(funcs, templates);
+        executor.set_sources(&self.sources, name);
         executor.set_missing_key(self.missing_key);
         executor.set_max_range_iters(self.max_range_iters);
         executor
@@ -789,7 +821,7 @@ impl Template {
             error::TemplateError::Exec(format!("template {:?} has not been parsed", self.name))
         })?;
 
-        let mut executor = self.make_executor(&self.funcs, &self.defines);
+        let mut executor = self.make_executor(&self.funcs, &self.defines, &self.name);
         executor.execute(writer, tree, data)
     }
 
@@ -815,7 +847,7 @@ impl Template {
             .get(name)
             .ok_or_else(|| error::TemplateError::UndefinedTemplate(name.to_string()))?;
 
-        let mut executor = self.make_executor(&self.funcs, &self.defines);
+        let mut executor = self.make_executor(&self.funcs, &self.defines, name);
         executor.execute(writer, tree.as_ref(), data)
     }
 
@@ -999,7 +1031,7 @@ impl Template {
         funcs: &BTreeMap<String, ValueFunc>,
         data: &Value,
     ) -> Result<()> {
-        let mut executor = self.make_executor(funcs, templates);
+        let mut executor = self.make_executor(funcs, templates, &self.name);
         executor.execute(writer, entry, data)
     }
 }
@@ -1039,6 +1071,7 @@ impl Clone for Template {
             name: self.name.clone(),
             tree: self.tree.clone(),
             defines: self.defines.clone(),
+            sources: self.sources.clone(),
             funcs: self.funcs.clone(),
             left_delim: self.left_delim.clone(),
             right_delim: self.right_delim.clone(),

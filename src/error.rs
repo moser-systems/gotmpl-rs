@@ -152,8 +152,22 @@ pub enum TemplateError {
     /// A general execution error (type mismatch, invalid operation, etc.).
     ///
     /// Prefer the structured variants below when they apply.
-    #[error("execution error: {0}")]
+    #[error("{0}")]
     Exec(String),
+
+    /// An execution error with Go's location and context:
+    /// `template: <parse name>:<line>:<col>: executing "<name>" at <<node>>: <message>`.
+    #[error("template: {location}: executing {name:?} at <{context}>: {source}")]
+    ExecAt {
+        /// `<parse name>:<line>:<col>`, the column being Go's 0-based byte offset.
+        location: String,
+        /// Name of the template being executed.
+        name: String,
+        /// The failing node, printed as template source.
+        context: String,
+        /// The underlying error.
+        source: alloc::boxed::Box<TemplateError>,
+    },
 
     /// An index or slice bound was outside the sequence it addressed.
     #[error("index out of range: {index}")]
@@ -172,7 +186,7 @@ pub enum TemplateError {
     },
 
     /// A required map key was missing and [`MissingKey::Error`](crate::MissingKey::Error) is set.
-    #[error("map has no entry for key: {key}")]
+    #[error("map has no entry for key \"{key}\"")]
     MissingKey {
         /// The key that was looked up.
         key: String,
@@ -202,14 +216,14 @@ pub enum TemplateError {
     },
 
     /// A `{{template "name"}}` action referenced a template that was never defined.
-    #[error("undefined template: {0}")]
+    #[error("template \"{0}\" not defined")]
     UndefinedTemplate(String),
 
     /// A template action referenced a function that is not registered.
     ///
     /// Register custom functions with [`Template::func`](crate::Template::func)
     /// before calling [`parse`](crate::Template::parse).
-    #[error("undefined function: {0}")]
+    #[error("\"{0}\" is not a defined function")]
     UndefinedFunction(String),
 
     /// A template action referenced a variable that has not been declared.
@@ -217,7 +231,7 @@ pub enum TemplateError {
     UndefinedVariable(String),
 
     /// A function was called with the wrong number of arguments.
-    #[error("wrong number of arguments: {name} expects {expected}, got {got}")]
+    #[error("wrong number of args for {name}: want {expected} got {got}")]
     ArgCount {
         /// Name of the function that was called.
         name: String,
@@ -230,7 +244,7 @@ pub enum TemplateError {
     /// A `{{range}}` action was applied to a value that is not iterable
     /// ([`Value::List`](crate::value::Value::List), [`Value::Map`](crate::value::Value::Map),
     /// or [`Value::Int`](crate::value::Value::Int)).
-    #[error("cannot range over {0}")]
+    #[error("range can't iterate over {0}")]
     NotIterable(String),
 
     /// Failed to read a template file passed to
@@ -298,6 +312,19 @@ pub enum TemplateError {
         /// Human-readable description of the escaping error.
         description: String,
     },
+}
+
+impl TemplateError {
+    /// The error without Go's execution context: for [`ExecAt`](Self::ExecAt)
+    /// the wrapped error, otherwise `self`. Useful for matching on the
+    /// structured variant of an execution error.
+    #[must_use]
+    pub fn without_context(&self) -> &TemplateError {
+        match self {
+            TemplateError::ExecAt { source, .. } => source.without_context(),
+            other => other,
+        }
+    }
 }
 
 impl From<core::fmt::Error> for TemplateError {

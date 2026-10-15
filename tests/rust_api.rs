@@ -548,7 +548,10 @@ fn test_missingkey_error_top_level() {
         .execute_to_string(&data)
         .unwrap_err();
     assert!(
-        matches!(err, gotmpl::TemplateError::MissingKey { .. }),
+        matches!(
+            err.without_context(),
+            gotmpl::TemplateError::MissingKey { .. }
+        ),
         "expected MissingKey, got {err:?}"
     );
 }
@@ -605,10 +608,11 @@ fn test_missingkey_error_three_level_miss_stops_at_first_miss() {
         .unwrap()
         .execute_to_string(&data)
         .unwrap_err();
-    match err {
+    match err.without_context() {
         gotmpl::TemplateError::MissingKey { key } => {
             assert_eq!(
-                key, "Y",
+                key.as_str(),
+                "Y",
                 "should error on first missing key, not later ones"
             );
         }
@@ -920,7 +924,10 @@ fn test_method_style_access_on_map_with_error_mode_errors() {
         .execute_to_string(&data)
         .unwrap_err();
     assert!(
-        matches!(err, gotmpl::TemplateError::MissingKey { .. }),
+        matches!(
+            err.without_context(),
+            gotmpl::TemplateError::MissingKey { .. }
+        ),
         "expected MissingKey, got {err:?}"
     );
 }
@@ -950,7 +957,7 @@ fn test_method_style_access_on_non_map_value_errors() {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "execution error: can't evaluate field Method in type int",
+        r#"template: t:1:2: executing "t" at <.Method>: can't evaluate field Method in type int"#,
     );
 }
 
@@ -1683,12 +1690,8 @@ fn test_parse_glob_character_class() {
 // explicit update to the new format.
 
 #[test]
-fn test_runtime_error_missingkey_lacks_position_info() {
-    // `.BadField` on line 3, column 1 — Go would say
-    //   template: t:3:3: map has no entry for key "BadField"
-    // We currently emit only the bare message. Exact-string assertion: the
-    // day Pos propagation lands, this test trips and forces an explicit
-    // update to the new format (and TODO.md:14).
+fn test_runtime_error_missingkey_reports_go_position() {
+    // `.BadField` on line 3 is reported with Go's location and node context.
     let data = tmap! { "X" => 1i64 };
     let src = "line1\nline2\n{{.BadField}}\nline4";
     let err = Template::new("t")
@@ -1697,7 +1700,11 @@ fn test_runtime_error_missingkey_lacks_position_info() {
         .unwrap()
         .execute_to_string(&data)
         .unwrap_err();
-    assert_eq!(err.to_string(), "map has no entry for key: BadField");
+    // Go's column is the 0-based byte offset within the line.
+    assert_eq!(
+        err.to_string(),
+        r#"template: t:3:2: executing "t" at <.BadField>: map has no entry for key "BadField""#
+    );
 }
 
 #[test]
@@ -1714,12 +1721,9 @@ fn test_undefined_function_is_a_parse_error() {
 }
 
 #[test]
-fn test_runtime_error_inside_range_lacks_position_info() {
-    // Error originating inside a `{{range}}` body — Go locates it inside the
-    // body, not at the `range` header. We can't yet distinguish the two.
-    // Exact-string assertion pins both the absence of Pos and the message
-    // form; either change trips the test. Items must be maps so `.BadField`
-    // triggers `MissingKey` (the variant we're pinning) rather than field-on-int.
+fn test_runtime_error_inside_range_reports_go_position() {
+    // An error inside a `{{range}}` body is located inside the body, as in Go.
+    // Items must be maps so `.BadField` triggers `MissingKey`.
     let data = tmap! {
         "Items" => alloc::vec![tmap! {}],
     };
@@ -1729,7 +1733,10 @@ fn test_runtime_error_inside_range_lacks_position_info() {
         .unwrap()
         .execute_to_string(&data)
         .unwrap_err();
-    assert_eq!(err.to_string(), "map has no entry for key: BadField");
+    assert_eq!(
+        err.to_string(),
+        r#"template: t:2:4: executing "t" at <.BadField>: map has no entry for key "BadField""#
+    );
 }
 
 // uint family — large unsigned values (Phase 5.1).

@@ -273,12 +273,14 @@ impl Value {
                 Ok(i as usize)
             }
         }
+        // Go's wording: slices/arrays/strings need an integer index; a map
+        // key must have the map's key type (string here).
         fn bad_index(kind: &str, idx: &Value) -> crate::error::TemplateError {
-            crate::error::TemplateError::Exec(format!(
-                "cannot index {} with type {}",
-                kind,
-                idx.type_name()
-            ))
+            crate::error::TemplateError::Exec(if kind == "map" {
+                format!("value has type {}; should be string", idx.type_name())
+            } else {
+                format!("cannot index slice/array with type {}", idx.type_name())
+            })
         }
         match (self, idx) {
             (Value::List(v), Value::Int(_) | Value::Uint(_)) => {
@@ -301,7 +303,7 @@ impl Value {
                 "index of untyped nil".into(),
             )),
             _ => Err(crate::error::TemplateError::Exec(format!(
-                "cannot index type {}",
+                "can't index item of type {}",
                 self.type_name()
             ))),
         }
