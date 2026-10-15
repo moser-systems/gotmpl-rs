@@ -481,6 +481,11 @@ fn sprintf_into(out: &mut String, fmt_str: &str, args: &[Value]) -> Result<()> {
                     }
                     spec.pad_in_place(out, start, false);
                 }
+                // Go applies `%s` to each element of a composite value.
+                Value::List(_) | Value::Map(_) | Value::Struct(_) => {
+                    let _ = arg.write_go(out, crate::value::GoVerb::S);
+                    spec.pad_in_place(out, start, false);
+                }
                 _ => write_bad_verb(out, verb, arg),
             },
             'd' => match arg {
@@ -542,7 +547,12 @@ fn sprintf_into(out: &mut String, fmt_str: &str, args: &[Value]) -> Result<()> {
                 None => write_bad_verb(out, verb, arg),
             },
             'v' => {
-                let _ = write!(out, "{}", arg);
+                let verb = if spec.plus {
+                    crate::value::GoVerb::PlusV
+                } else {
+                    crate::value::GoVerb::V
+                };
+                let _ = arg.write_go(out, verb);
                 spec.pad_in_place(out, start, false);
             }
             'U' => {

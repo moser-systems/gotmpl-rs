@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"text/template"
 )
@@ -19,6 +20,13 @@ type TypedValue struct {
 	Value json.RawMessage         `json:"value,omitempty"`
 	Items []TypedValue            `json:"items,omitempty"`
 	Map   map[string]TypedValue   `json:"map,omitempty"`
+	Fields []TypedField           `json:"fields,omitempty"`
+}
+
+// TypedField is one field of a struct value, in declaration order.
+type TypedField struct {
+	Name  string     `json:"name"`
+	Value TypedValue `json:"value"`
 }
 
 type Input struct {
@@ -80,6 +88,30 @@ func decode(tv TypedValue) (interface{}, error) {
 			result[k] = decoded
 		}
 		return result, nil
+	case "struct":
+		// An anonymous struct type built at run time: each field has its
+		// value's dynamic type, or interface{} for nil.
+		fields := make([]reflect.StructField, len(tv.Fields))
+		values := make([]reflect.Value, len(tv.Fields))
+		for i, f := range tv.Fields {
+			decoded, err := decode(f.Value)
+			if err != nil {
+				return nil, fmt.Errorf("decode field %q: %w", f.Name, err)
+			}
+			typ := reflect.TypeOf((*interface{})(nil)).Elem()
+			if decoded != nil {
+				typ = reflect.TypeOf(decoded)
+			}
+			fields[i] = reflect.StructField{Name: f.Name, Type: typ}
+			values[i] = reflect.ValueOf(decoded)
+		}
+		result := reflect.New(reflect.StructOf(fields)).Elem()
+		for i, v := range values {
+			if v.IsValid() {
+				result.Field(i).Set(v)
+			}
+		}
+		return result.Interface(), nil
 	default:
 		return nil, fmt.Errorf("unknown type tag: %q", tv.Type)
 	}

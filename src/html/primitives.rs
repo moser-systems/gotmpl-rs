@@ -584,6 +584,19 @@ fn json_encode(v: &Value, out: &mut String) {
             }
             out.push('}');
         }
+        // Go's json.Marshal encodes a struct's fields in declaration order.
+        Value::Struct(st) => {
+            out.push('{');
+            for (i, (k, val)) in st.fields().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json_quote(k, out);
+                out.push(':');
+                json_encode(val, out);
+            }
+            out.push('}');
+        }
         // Go's json.Marshal cannot encode a func; it returns an error. We emit
         // `null` so the surrounding script stays syntactically valid.
         Value::Function(_) => out.push_str("null"),

@@ -123,9 +123,11 @@ assert_eq!(tmpl.execute_to_string(&data).unwrap(), "Alice (30) admin");
 
 Both entry points return `Result<Value>` (serde serialization can fail on a
 non-string map key or an out-of-range 128-bit integer) and, like `ToValue`,
-materialize the whole value eagerly. Structs and maps become `Value::Map`, so
-field access uses **map** semantics: a missing field yields `<no value>` by
-default. The feature is `no_std`-compatible. See `examples/serde.rs`
+materialize the whole value eagerly. Maps become `Value::Map`; structs become
+`Value::Struct`, which keeps field order and behaves like a Go struct: it
+prints as `{a b}` (`{A:a B:b}` with `%+v`), and an unknown field is an error
+whatever the `missingkey` option. serde's struct name is the Go type name in
+error messages; `#[serde(rename = "main.Job")]` sets it. The feature is `no_std`-compatible. See `examples/serde.rs`
 (`cargo run --example serde --features serde`) and the `ser` module docs for the
 rest of the mapping (map-key stringification and ordering-vs-Go).
 
@@ -398,8 +400,9 @@ User-defined functions that panic will propagate instead of being caught.
 
 Rust has no runtime reflection, so:
 
-- **No struct field access**: use `Value::Map` instead
-- **No method calls**: `.Foo` is always a field lookup against a `Value::Map`,
+- **Structs are data only**: `Value::Struct` (built directly or by serde) has
+  fields, but no methods and no embedded-field promotion
+- **No method calls**: `.Foo` is always a field lookup against a map or struct,
   never a method invocation. Register the callable via `.func()`, or store
   it as `Value::Function` and dispatch with the `call` builtin.
 - **No pointer/interface indirection**: `Value` is always concrete
